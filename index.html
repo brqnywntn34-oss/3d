@@ -1,305 +1,1040 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Prompt → STL (single file MVP)</title>
-  <style>
-    :root{--bg:#0f1724;--card:#0b1220;--muted:#94a3b8;--accent:#7c3aed}
-    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial}
-    body{display:flex;align-items:stretch;gap:18px;padding:18px;background:linear-gradient(180deg,#071024 0,#071827 100%);color:#e6eef8}
-    .panel{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);border-radius:12px;padding:18px;box-shadow:0 6px 30px rgba(2,6,23,0.6)}
-    .left{width:420px;min-width:320px}
-    .right{flex:1;min-height:520px;display:flex;flex-direction:column}
-    h1{margin:0 0 10px 0;font-size:18px}
-    label{font-size:13px;color:var(--muted);display:block;margin-bottom:8px}
-    textarea{width:100%;height:150px;padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit;resize:vertical;font-size:14px}
-    .row{display:flex;gap:10px;margin-top:12px}
-    button{cursor:pointer;padding:10px 14px;border-radius:10px;border:0;font-weight:600}
-    .btn-primary{background:var(--accent);color:white}
-    .btn-ghost{background:transparent;color:var(--muted);border:1px solid rgba(255,255,255,0.04)}
-    .status{margin-top:10px;font-size:13px;color:var(--muted)}
-    #viewer{flex:1;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,0.03);background:linear-gradient(180deg,#071827 0,#071024 100%)}
-    .meta{font-size:12px;color:var(--muted);margin-top:8px}
-    .footer{font-size:12px;color:var(--muted);margin-top:12px}
-    a.small{color:var(--accent);text-decoration:none}
-    @media (max-width:880px){body{flex-direction:column;padding:12px}.left{width:auto}}
-  </style>
-</head>
-<body>
-  <div class="panel left">
-    <h1>Prompt → STL (local)</h1>
-    <label for="prompt">Describe your object</label>
-    <textarea id="prompt" placeholder='e.g. "40mm x 20mm x 10mm rectangular box" or "a box 4cm by 2cm by 1cm"'>40mm x 20mm x 10mm box</textarea>
-
-    <div class="row">
-      <button id="generateBtn" class="btn-primary">Generate STL</button>
-      <button id="downloadBtn" class="btn-ghost" disabled>Download STL</button>
-      <button id="resetBtn" class="btn-ghost">Reset</button>
-    </div>
-
-    <div class="status" id="status">Ready — type a prompt and click Generate.</div>
-    <div class="meta" id="meta"></div>
-    <div class="footer">This single-file MVP generates a printable ASCII STL (axis-aligned box). You can extend parsing/generation later.</div>
-  </div>
-
-  <div class="panel right">
-    <div id="viewer"></div>
-  </div>
-
-  <!-- Module script: three.js + examples via unpkg (module imports) -->
-  <script type="module">
-    import * as THREE from "https://unpkg.com/three@0.165.0/build/three.module.js";
-    import { OrbitControls } from "https://unpkg.com/three@0.165.0/examples/jsm/controls/OrbitControls.js";
-    import { STLLoader } from "https://unpkg.com/three@0.165.0/examples/jsm/loaders/STLLoader.js";
-
-    // ---- UI elements ----
-    const promptEl = document.getElementById("prompt");
-    const generateBtn = document.getElementById("generateBtn");
-    const downloadBtn = document.getElementById("downloadBtn");
-    const statusEl = document.getElementById("status");
-    const metaEl = document.getElementById("meta");
-    const resetBtn = document.getElementById("resetBtn");
-    const viewerEl = document.getElementById("viewer");
-
-    // ---- Three.js scene setup ----
-    const scene = new THREE.Scene();
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
-    renderer.setClearColor(0x071022, 1);
-    viewerEl.appendChild(renderer.domElement);
-
-    const camera = new THREE.PerspectiveCamera(40, viewerEl.clientWidth / viewerEl.clientHeight, 0.1, 2000);
-    camera.position.set(120, 120, 120);
-
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.target.set(0,0,0);
-
-    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
-    scene.add(ambient);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
-    dir.position.set(100, 200, 100);
-    scene.add(dir);
-
-    // ground grid helper
-    const grid = new THREE.GridHelper(200, 40, 0x1f2b3a, 0x0b1220);
-    grid.position.y = -60;
-    scene.add(grid);
-
-    // currently previewed mesh
-    let previewGroup = new THREE.Group();
-    scene.add(previewGroup);
-
-    // handle resize
-    window.addEventListener("resize", () => {
-      renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
-      camera.aspect = viewerEl.clientWidth / viewerEl.clientHeight;
-      camera.updateProjectionMatrix();
-    });
-
-    // animation loop
-    function animate(){
-      requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
-    }
-    animate();
-
-    // ---- Parsing prompt for box dims ----
-    // returns number in mm
-    function parseNumberUnit(token){
-      // trim and match numeric optionally followed by unit
-      // Accept forms like "40", "40mm", "4cm", "1.5in"
-      const m = token.trim().match(/^([0-9]*\.?[0-9]+)\s*(mm|cm|in)?$/i);
-      if(!m) return null;
-      let val = parseFloat(m[1]);
-      const unit = (m[2] || "mm").toLowerCase();
-      if(unit === "cm") val = val * 10;           // 1 cm = 10 mm
-      if(unit === "in") val = val * 25.4;         // 1 in = 25.4 mm
-      return val;
-    }
-
-    function parseBoxDimsFromPrompt(prompt){
-      const p = (prompt || "").toLowerCase();
-
-      // pattern like "A x B x C" where A,B,C may have units
-      // Accept separators: x, ×, by
-      const byPattern = /([0-9]*\.?[0-9]+\s*(?:mm|cm|in)?)\s*(?:x|×|by)\s*([0-9]*\.?[0-9]+\s*(?:mm|cm|in)?)\s*(?:x|×|by)\s*([0-9]*\.?[0-9]+\s*(?:mm|cm|in)?)/i;
-      const m1 = p.match(byPattern);
-      if(m1){
-        const a = parseNumberUnit(m1[1]);
-        const b = parseNumberUnit(m1[2]);
-        const c = parseNumberUnit(m1[3]);
-        if([a,b,c].every(n => Number.isFinite(n))) return { x:a, y:b, z:c };
-      }
-
-      // fallback: find first three numbers (with optional units)
-      const arr = Array.from(p.matchAll(/([0-9]*\.?[0-9]+)\s*(mm|cm|in)?/g)).map(m => parseNumberUnit((m[1] + (m[2]||"")).trim())).filter(v => v != null);
-      if(arr.length >= 3) return { x: arr[0], y: arr[1], z: arr[2] };
-
-      // Try text like "box 4cm by 2cm by 1cm" handled above, else default
-      return { x:40, y:20, z:10 }; // mm fallback
-    }
-
-    // ---- STL generation (ASCII) ----
-    // generate ASCII STL for axis-aligned box centered at origin (units: mm)
-    function generateBoxSTL(size){
-      const x = size.x, y = size.y, z = size.z;
-      const hx = x/2, hy = y/2, hz = z/2;
-
-      function facet(nx, ny, nz, v1, v2, v3){
-        return `  facet normal ${nx} ${ny} ${nz}
-    outer loop
-      vertex ${v1[0]} ${v1[1]} ${v1[2]}
-      vertex ${v2[0]} ${v2[1]} ${v2[2]}
-      vertex ${v3[0]} ${v3[1]} ${v3[2]}
-    endloop
-  endfacet
-`;
-      }
-
-      let stl = `solid box\n`;
-      // +Z top
-      stl += facet(0,0,1, [-hx,-hy,hz], [ hx,-hy,hz], [ hx, hy,hz]);
-      stl += facet(0,0,1, [-hx,-hy,hz], [ hx, hy,hz], [-hx, hy,hz]);
-      // -Z bottom
-      stl += facet(0,0,-1, [-hx,-hy,-hz], [-hx, hy,-hz], [ hx, hy,-hz]);
-      stl += facet(0,0,-1, [-hx,-hy,-hz], [ hx, hy,-hz], [ hx,-hy,-hz]);
-      // +X right
-      stl += facet(1,0,0, [hx,-hy,-hz], [hx, hy,-hz], [hx, hy, hz]);
-      stl += facet(1,0,0, [hx,-hy,-hz], [hx, hy, hz], [hx,-hy, hz]);
-      // -X left
-      stl += facet(-1,0,0, [-hx,-hy,-hz], [-hx,-hy, hz], [-hx, hy, hz]);
-      stl += facet(-1,0,0, [-hx,-hy,-hz], [-hx, hy, hz], [-hx, hy,-hz]);
-      // +Y front
-      stl += facet(0,1,0, [-hx,hy,-hz], [-hx,hy, hz], [ hx,hy, hz]);
-      stl += facet(0,1,0, [-hx,hy,-hz], [ hx,hy, hz], [ hx,hy,-hz]);
-      // -Y back
-      stl += facet(0,-1,0, [-hx,-hy,-hz], [ hx,-hy,-hz], [ hx,-hy, hz]);
-      stl += facet(0,-1,0, [-hx,-hy,-hz], [ hx,-hy, hz], [-hx,-hy, hz]);
-
-      stl += `endsolid box\n`;
-      return stl;
-    }
-
-    // ---- Preview: parse STL and add to scene ----
-    const loader = new STLLoader();
-
-    function clearPreview(){
-      while(previewGroup.children.length) previewGroup.remove(previewGroup.children[0]);
-    }
-
-    function addSTLToScene(arrayBuffer, colorHex=0x6d28d9){
-      clearPreview();
-      try {
-        const geometry = loader.parse(arrayBuffer);
-        geometry.computeBoundingBox && geometry.computeBoundingBox();
-        geometry.computeVertexNormals && geometry.computeVertexNormals();
-
-        // center
-        const box = geometry.boundingBox;
-        if(box){
-          const size = new THREE.Vector3();
-          box.getSize(size);
-          const center = new THREE.Vector3();
-          box.getCenter(center);
-          geometry.translate(-center.x, -center.y, -center.z);
-          const maxDim = Math.max(size.x, size.y, size.z);
-          const scale = maxDim > 0 ? 60 / maxDim : 1;
-          geometry.scale(scale, scale, scale);
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Clone</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        const material = new THREE.MeshStandardMaterial({ color: colorHex, metalness: 0.12, roughness: 0.55 });
-        const mesh = new THREE.Mesh(geometry, material);
-        mesh.castShadow = true;
-        mesh.receiveShadow = true;
-        previewGroup.add(mesh);
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            overflow: hidden;
+        }
 
-        // adjust camera to fit
-        controls.target.set(0,0,0);
-        camera.position.set(120, 120, 120);
-        controls.update();
-      } catch(err){
-        console.error("STL parse error:", err);
-        statusEl.textContent = "Preview failed (STL parse).";
-      }
-    }
+        .container {
+            display: flex;
+            height: 100vh;
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 0 50px rgba(0,0,0,0.3);
+        }
 
-    // ---- Download helper ----
-    let latestBlob = null;
+        .sidebar {
+            width: 350px;
+            background: #f0f2f5;
+            border-left: 1px solid #e5e7eb;
+            display: flex;
+            flex-direction: column;
+        }
 
-    function enableDownload(blob, filename="model.stl"){
-      latestBlob = blob;
-      downloadBtn.disabled = false;
-      downloadBtn.onclick = () => {
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      };
-    }
+        .sidebar-header {
+            background: #00a884;
+            padding: 20px;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
 
-    // ---- Button handlers ----
-    generateBtn.addEventListener("click", async () => {
-      const prompt = (promptEl.value || "").trim();
-      if(!prompt){
-        statusEl.textContent = "Please enter a prompt.";
-        return;
-      }
-      statusEl.textContent = "Parsing prompt…";
-      // parse dims
-      const dims = parseBoxDimsFromPrompt(prompt); // {x,y,z} in mm
-      // Round dims sensibly for metadata display (digit-by-digit careful calc)
-      function roundTo(val, places){
-        const m = Math.pow(10, places);
-        return Math.round(val * m) / m;
-      }
-      const rx = roundTo(dims.x, 3), ry = roundTo(dims.y, 3), rz = roundTo(dims.z, 3);
+        .user-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #25d366;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
 
-      statusEl.textContent = `Generating box ${rx} × ${ry} × ${rz} mm…`;
-      // generate STL string
-      const stlText = generateBoxSTL(dims);
-      const encoder = new TextEncoder();
-      const arrayBuffer = encoder.encode(stlText).buffer;
-      const blob = new Blob([arrayBuffer], { type: "model/stl" });
-      enableDownload(blob, "model.stl");
+        .tabs {
+            display: flex;
+            background: white;
+            border-bottom: 1px solid #e5e7eb;
+        }
 
-      // update meta
-      metaEl.textContent = `Size: ${rx} mm × ${ry} mm × ${rz} mm — ASCII STL, ${Math.round(blob.size/1)} bytes`;
+        .tab {
+            flex: 1;
+            padding: 15px 10px;
+            text-align: center;
+            cursor: pointer;
+            background: transparent;
+            border: none;
+            font-size: 13px;
+            color: #667781;
+            transition: all 0.3s ease;
+        }
 
-      // show preview
-      statusEl.textContent = "Rendering preview…";
-      addSTLToScene(arrayBuffer, 0x6d28d9);
-      statusEl.textContent = "Done — preview ready. Click Download to save the .stl file.";
-    });
+        .tab.active {
+            color: #00a884;
+            border-bottom: 2px solid #00a884;
+            background: #f0f9ff;
+        }
 
-    resetBtn.addEventListener("click", () => {
-      promptEl.value = "40mm x 20mm x 10mm box";
-      statusEl.textContent = "Reset to default prompt.";
-      metaEl.textContent = "";
-      clearPreview();
-      downloadBtn.disabled = true;
-      latestBlob = null;
-    });
+        .tab:hover {
+            background: #f8f9fa;
+        }
 
-    // initial sample preview
-    (function initial(){
-      const sample = promptEl.value.trim();
-      const dims = parseBoxDimsFromPrompt(sample);
-      const stlText = generateBoxSTL(dims);
-      const encoder = new TextEncoder();
-      const arrayBuffer = encoder.encode(stlText).buffer;
-      addSTLToScene(arrayBuffer, 0x6d28d9);
-      metaEl.textContent = `Sample: ${dims.x}mm × ${dims.y}mm × ${dims.z}mm`;
-      const blob = new Blob([arrayBuffer], { type: "model/stl" });
-      enableDownload(blob, "model.stl");
-      statusEl.textContent = "Ready — previewing sample box. Edit prompt and click Generate.";
-    })();
+        .search-container {
+            padding: 15px;
+            background: white;
+        }
 
-  </script>
+        .search-box {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid #e5e7eb;
+            border-radius: 25px;
+            font-size: 14px;
+            background: #f0f2f5;
+            outline: none;
+        }
+
+        .content-list {
+            flex: 1;
+            overflow-y: auto;
+            background: white;
+        }
+
+        .chat-item, .contact-item, .status-item, .channel-item {
+            padding: 15px 20px;
+            border-bottom: 1px solid #f0f2f5;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            transition: background 0.2s ease;
+        }
+
+        .chat-item:hover, .contact-item:hover, .status-item:hover, .channel-item:hover {
+            background: #f8f9fa;
+        }
+
+        .chat-item.active {
+            background: #e3f2fd;
+        }
+
+        .avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #25d366, #128c7e);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .item-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .item-name {
+            font-weight: 600;
+            color: #111b21;
+            margin-bottom: 4px;
+        }
+
+        .item-message, .item-phone {
+            color: #667781;
+            font-size: 14px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .item-time {
+            color: #667781;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        .chat-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #efeae2;
+        }
+
+        .chat-header {
+            background: #f0f2f5;
+            padding: 15px 20px;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: linear-gradient(135deg, #efeae2 0%, #f7f3f0 100%);
+        }
+
+        .message {
+            max-width: 70%;
+            margin: 10px 0;
+            padding: 12px 15px;
+            border-radius: 15px;
+            position: relative;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            animation: messageSlide 0.3s ease-out;
+        }
+
+        @keyframes messageSlide {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.sent {
+            background: #d1f4cc;
+            margin-left: auto;
+            border-bottom-left-radius: 5px;
+        }
+
+        .message.received {
+            background: white;
+            margin-right: auto;
+            border-bottom-right-radius: 5px;
+        }
+
+        .message-time {
+            font-size: 11px;
+            color: #667781;
+            margin-top: 5px;
+            text-align: left;
+        }
+
+        .chat-input {
+            background: #f0f2f5;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .message-input {
+            flex: 1;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 25px;
+            background: white;
+            font-size: 14px;
+            outline: none;
+        }
+
+        .send-btn {
+            width: 45px;
+            height: 45px;
+            border: none;
+            border-radius: 50%;
+            background: #00a884;
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            transition: all 0.3s ease;
+        }
+
+        .send-btn:hover {
+            background: #128c7e;
+            transform: scale(1.05);
+        }
+
+        .welcome-screen {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+        }
+
+        .welcome-icon {
+            width: 100px;
+            height: 100px;
+            margin-bottom: 30px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 40px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+
+        .modal-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            width: 450px;
+            max-width: 90%;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+        }
+
+        .modal h3 {
+            margin-bottom: 25px;
+            color: #111b21;
+            text-align: center;
+            font-size: 20px;
+        }
+
+        .modal input, .modal textarea {
+            width: 100%;
+            padding: 15px;
+            margin: 10px 0;
+            border: 2px solid #e5e7eb;
+            border-radius: 10px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s ease;
+        }
+
+        .modal input:focus, .modal textarea:focus {
+            border-color: #00a884;
+        }
+
+        .modal-buttons {
+            display: flex;
+            gap: 15px;
+            margin-top: 25px;
+            justify-content: center;
+        }
+
+        .btn {
+            padding: 12px 25px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary {
+            background: #00a884;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #128c7e;
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: #e5e7eb;
+            color: #374151;
+        }
+
+        .btn-secondary:hover {
+            background: #d1d5db;
+        }
+
+        .status-circle {
+            position: relative;
+        }
+
+        .status-circle::after {
+            content: '';
+            position: absolute;
+            bottom: 2px;
+            left: 2px;
+            width: 15px;
+            height: 15px;
+            background: #25d366;
+            border: 2px solid white;
+            border-radius: 50%;
+        }
+
+        .add-btn {
+            position: fixed;
+            bottom: 30px;
+            left: 280px;
+            width: 60px;
+            height: 60px;
+            background: #00a884;
+            border: none;
+            border-radius: 50%;
+            color: white;
+            font-size: 28px;
+            cursor: pointer;
+            box-shadow: 0 4px 20px rgba(0,168,132,0.4);
+            z-index: 100;
+            transition: all 0.3s ease;
+        }
+
+        .add-btn:hover {
+            background: #128c7e;
+            transform: scale(1.1);
+            box-shadow: 0 6px 25px rgba(0,168,132,0.5);
+        }
+
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 25px;
+            background: #00a884;
+            color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,168,132,0.3);
+            z-index: 1001;
+            animation: slideIn 0.3s ease-out;
+            font-weight: 600;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(300px);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #667781;
+        }
+
+        .empty-state h3 {
+            margin-bottom: 10px;
+            color: #111b21;
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                width: 100%;
+            }
+            
+            .add-btn {
+                left: 30px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="user-avatar">א</div>
+                <h2>WhatsApp Clone</h2>
+                <div style="cursor: pointer;">⚙️</div>
+            </div>
+
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('chats')">💬 צ'אטים</button>
+                <button class="tab" onclick="switchTab('contacts')">👥 אנשי קשר</button>
+                <button class="tab" onclick="switchTab('status')">📸 סטטוס</button>
+                <button class="tab" onclick="switchTab('channels')">📢 ערוצים</button>
+            </div>
+
+            <div class="search-container">
+                <input type="text" class="search-box" placeholder="חיפוש...">
+            </div>
+
+            <div class="content-list" id="contentList">
+                </div>
+        </div>
+
+        <div class="chat-area" id="chatArea">
+            <div class="welcome-screen">
+                <div class="welcome-icon">💬</div>
+                <h2>ברוכים הבאים ל-WhatsApp Clone</h2>
+                <p>בחרו צ'אט כדי להתחיל לשוחח</p>
+            </div>
+        </div>
+
+        <button class="add-btn" onclick="showAddModal()">+</button>
+    </div>
+
+    <div class="modal" id="contactModal">
+        <div class="modal-content">
+            <h3>הוסף איש קשר חדש</h3>
+            <input type="text" id="contactName" placeholder="שם מלא" required>
+            <input type="tel" id="contactPhone" placeholder="מספר טלפון (לדוגמה: 050-1234567)" required>
+            <div class="modal-buttons">
+                <button class="btn btn-secondary" onclick="closeModal()">ביטול</button>
+                <button class="btn btn-primary" onclick="addNewContact()">הוסף איש קשר</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="statusModal">
+        <div class="modal-content">
+            <h3>פרסם סטטוס חדש</h3>
+            <textarea id="statusText" placeholder="מה המצב היום?" rows="4"></textarea>
+            <div class="modal-buttons">
+                <button class="btn btn-secondary" onclick="closeModal()">ביטול</button>
+                <button class="btn btn-primary" onclick="addNewStatus()">פרסם</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="channelModal">
+        <div class="modal-content">
+            <h3>צור ערוץ חדש</h3>
+            <input type="text" id="channelName" placeholder="שם הערוץ">
+            <textarea id="channelDesc" placeholder="תיאור הערוץ" rows="3"></textarea>
+            <div class="modal-buttons">
+                <button class="btn btn-secondary" onclick="closeModal()">ביטול</button>
+                <button class="btn btn-primary" onclick="addNewChannel()">צור ערוץ</button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="modal" id="verificationModal">
+        <div class="modal-content">
+            <h3>אמת מספר טלפון</h3>
+            <p>הקוד נשלח למספר הטלפון שסיפקת.</p>
+            <input type="text" id="verificationCode" placeholder="הכנס קוד אימות" required>
+            <div class="modal-buttons">
+                <button class="btn btn-secondary" onclick="closeModal()">ביטול</button>
+                <button class="btn btn-primary" onclick="verifyCode()">אמת</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // משתנים גלובליים
+        let currentTab = 'chats';
+        let currentChat = null;
+        let contactIdCounter = 100;
+        let pendingContact = null; // ישמור פרטי איש קשר עד לאימות
+
+        // רשימת משתמשים "רשומים" מראש לצורך הדגמה
+        const registeredUsers = [
+            { id: 1, name: 'דני כהן', phone: '050-1111111', avatar: 'ד', online: true },
+            { id: 2, name: 'שרה לוי', phone: '052-2222222', avatar: 'ש', online: false },
+            { id: 3, name: 'אבי ישראלי', phone: '054-3333333', avatar: 'א', online: true },
+            { id: 4, name: 'יונתן גולד', phone: '050-1234567', avatar: 'י', online: true }
+        ];
+
+        // נתונים
+        let contacts = [
+            { id: 1, name: 'דני כהן', phone: '050-1111111', avatar: 'ד', online: true },
+            { id: 2, name: 'שרה לוי', phone: '052-2222222', avatar: 'ש', online: false },
+            { id: 3, name: 'אבי ישראלי', phone: '054-3333333', avatar: 'א', online: true }
+        ];
+
+        let chats = [
+            {
+                id: 1,
+                name: 'דני כהן',
+                avatar: 'ד',
+                lastMessage: 'שלום, מה נשמע?',
+                time: '14:30',
+                online: true,
+                messages: [
+                    { text: 'היי!', time: '14:25', sent: false },
+                    { text: 'שלום, מה נשמע?', time: '14:30', sent: false }
+                ]
+            }
+        ];
+
+        let statuses = [
+            { id: 1, name: 'שרה לוי', avatar: 'ש', text: 'יום נפלא! 😊', time: '3 שעות', viewed: false }
+        ];
+
+        let channels = [
+            { id: 1, name: 'חדשות טכנולוגיה', avatar: '🔬', description: 'עדכונים טכנולוגיים', subscribers: 1250 }
+        ];
+
+        // פונקציות עזר
+        function getCurrentTime() {
+            const now = new Date();
+            return now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
+        }
+
+        function getFirstLetter(name) {
+            return name.charAt(0).toUpperCase();
+        }
+
+        function showNotification(message) {
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.textContent = message;
+            document.body.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.remove();
+            }, 3000);
+        }
+
+        // החלפת טאבים
+        function switchTab(tabName) {
+            currentTab = tabName;
+            
+            // עדכון הטאבים
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            
+            // עדכון התוכן
+            renderContent();
+        }
+
+        // רינדור התוכן
+        function renderContent() {
+            const contentList = document.getElementById('contentList');
+            
+            switch(currentTab) {
+                case 'chats':
+                    renderChats();
+                    break;
+                case 'contacts':
+                    renderContacts();
+                    break;
+                case 'status':
+                    renderStatus();
+                    break;
+                case 'channels':
+                    renderChannels();
+                    break;
+            }
+        }
+
+        // רינדור צ'אטים
+        function renderChats() {
+            const contentList = document.getElementById('contentList');
+            
+            if (chats.length === 0) {
+                contentList.innerHTML = `
+                    <div class="empty-state">
+                        <h3>אין צ'אטים</h3>
+                        <p>התחילו צ'אט עם אחד מאנשי הקשר</p>
+                    </div>
+                `;
+                return;
+            }
+
+            contentList.innerHTML = chats.map(chat => `
+                <div class="chat-item ${currentChat?.id === chat.id ? 'active' : ''}" onclick="openChat(${chat.id})">
+                    <div class="avatar ${chat.online ? 'status-circle' : ''}">${chat.avatar}</div>
+                    <div class="item-info">
+                        <div class="item-name">${chat.name}</div>
+                        <div class="item-message">${chat.lastMessage}</div>
+                    </div>
+                    <div class="item-time">${chat.time}</div>
+                </div>
+            `).join('');
+        }
+
+        // רינדור אנשי קשר
+        function renderContacts() {
+            const contentList = document.getElementById('contentList');
+            
+            if (contacts.length === 0) {
+                contentList.innerHTML = `
+                    <div class="empty-state">
+                        <h3>אין אנשי קשר</h3>
+                        <p>הוסיפו אנשי קשר חדשים</p>
+                    </div>
+                `;
+                return;
+            }
+
+            contentList.innerHTML = contacts.map(contact => `
+                <div class="contact-item" onclick="startChat('${contact.name}', '${contact.avatar}', ${contact.online}, ${contact.id})">
+                    <div class="avatar ${contact.online ? 'status-circle' : ''}">${contact.avatar}</div>
+                    <div class="item-info">
+                        <div class="item-name">${contact.name}</div>
+                        <div class="item-phone">${contact.phone}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // רינדור סטטוסים
+        function renderStatus() {
+            const contentList = document.getElementById('contentList');
+            
+            if (statuses.length === 0) {
+                contentList.innerHTML = `
+                    <div class="empty-state">
+                        <h3>אין סטטוסים</h3>
+                        <p>פרסמו סטטוס ראשון</p>
+                    </div>
+                `;
+                return;
+            }
+
+            contentList.innerHTML = statuses.map(status => `
+                <div class="status-item" onclick="viewStatus(${status.id})">
+                    <div class="avatar">${status.avatar}</div>
+                    <div class="item-info">
+                        <div class="item-name">${status.name}</div>
+                        <div class="item-message">${status.text}</div>
+                    </div>
+                    <div class="item-time">${status.time}</div>
+                </div>
+            `).join('');
+        }
+
+        // רינדור ערוצים
+        function renderChannels() {
+            const contentList = document.getElementById('contentList');
+            
+            if (channels.length === 0) {
+                contentList.innerHTML = `
+                    <div class="empty-state">
+                        <h3>אין ערוצים</h3>
+                        <p>צרו ערוץ ראשון</p>
+                    </div>
+                `;
+                return;
+            }
+
+            contentList.innerHTML = channels.map(channel => `
+                <div class="channel-item" onclick="joinChannel('${channel.name}', '${channel.avatar}')">
+                    <div class="avatar">${channel.avatar}</div>
+                    <div class="item-info">
+                        <div class="item-name">${channel.name}</div>
+                        <div class="item-message">${channel.description}</div>
+                        <div style="font-size: 12px; color: #667781;">${channel.subscribers} מנויים</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // פתיחת צ'אט
+        function openChat(chatId) {
+            currentChat = chats.find(chat => chat.id === chatId);
+            if (!currentChat) return;
+
+            const chatArea = document.getElementById('chatArea');
+            chatArea.innerHTML = `
+                <div class="chat-header">
+                    <div class="avatar ${currentChat.online ? 'status-circle' : ''}">${currentChat.avatar}</div>
+                    <div class="item-info">
+                        <div class="item-name">${currentChat.name}</div>
+                        <div style="font-size: 12px; color: #667781;">
+                            ${currentChat.online ? 'מחובר עכשיו' : 'לא מחובר'}
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="chat-messages" id="chatMessages">
+                    ${currentChat.messages.map(msg => `
+                        <div class="message ${msg.sent ? 'sent' : 'received'}">
+                            ${msg.text}
+                            <div class="message-time">${msg.time}</div>
+                        </div>
+                    `).join('')}
+                </div>
+                
+                <div class="chat-input">
+                    <input type="text" class="message-input" placeholder="הקלידו הודעה..." 
+                           onkeydown="handleKeyPress(event)" id="messageInput">
+                    <button class="send-btn" onclick="sendMessage()">➤</button>
+                </div>
+            `;
+            
+            scrollToBottom();
+            renderChats(); // עדכון הרשימה
+        }
+
+        // שליחת הודעה
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            
+            if (!text || !currentChat) return;
+            
+            // הוספת ההודעה
+            const newMessage = {
+                text: text,
+                time: getCurrentTime(),
+                sent: true
+            };
+            
+            currentChat.messages.push(newMessage);
+            currentChat.lastMessage = text;
+            currentChat.time = getCurrentTime();
+            
+            // עדכון התצוגה
+            const messagesContainer = document.getElementById('chatMessages');
+            messagesContainer.innerHTML += `
+                <div class="message sent">
+                    ${text}
+                    <div class="message-time">${getCurrentTime()}</div>
+                </div>
+            `;
+            
+            input.value = '';
+            scrollToBottom();
+            renderChats();
+            
+            // הודעת תגובה אוטומטית
+            setTimeout(() => {
+                const replies = ['קיבלתי!', 'תודה!', 'מעולה!', 'בסדר גמור', 'הבנתי 👍'];
+                const reply = replies[Math.floor(Math.random() * replies.length)];
+                
+                const autoMessage = {
+                    text: reply,
+                    time: getCurrentTime(),
+                    sent: false
+                };
+                
+                currentChat.messages.push(autoMessage);
+                currentChat.lastMessage = reply;
+                currentChat.time = getCurrentTime();
+                
+                messagesContainer.innerHTML += `
+                    <div class="message received">
+                        ${reply}
+                        <div class="message-time">${getCurrentTime()}</div>
+                    </div>
+                `;
+                
+                scrollToBottom();
+                renderChats();
+            }, 1500);
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        function scrollToBottom() {
+            const messagesContainer = document.getElementById('chatMessages');
+            if (messagesContainer) {
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }
+        }
+
+        // התחלת צ'אט עם איש קשר
+        function startChat(name, avatar, online, contactId) {
+            // בדיקה אם כבר יש צ'אט
+            let existingChat = chats.find(chat => chat.name === name);
+            
+            if (!existingChat) {
+                // יצירת צ'אט חדש
+                const newChat = {
+                    id: Date.now(),
+                    name: name,
+                    avatar: avatar,
+                    lastMessage: 'צ\'אט חדש התחיל',
+                    time: getCurrentTime(),
+                    online: online,
+                    messages: [{
+                        text: `התחיל צ'אט עם ${name}`,
+                        time: getCurrentTime(),
+                        sent: false
+                    }]
+                };
+                
+                chats.unshift(newChat);
+                showNotification(`צ'אט חדש נוצר עם ${name}`);
+            }
+            
+            // מעבר לטאב צ'אטים ופתיחת הצ'אט
+            switchTabProgrammatically('chats');
+            openChat(existingChat ? existingChat.id : chats[0].id);
+        }
+
+        function switchTabProgrammatically(tabName) {
+            currentTab = tabName;
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelector(`[onclick="switchTab('${tabName}')"]`).classList.add('active');
+            renderContent();
+        }
+
+        // הצגת מודל הוספה
+        function showAddModal() {
+            let modalId;
+            
+            switch(currentTab) {
+                case 'contacts':
+                    modalId = 'contactModal';
+                    break;
+                case 'status':
+                    modalId = 'statusModal';
+                    break;
+                case 'channels':
+                    modalId = 'channelModal';
+                    break;
+                default:
+                    modalId = 'contactModal';
+                    switchTabProgrammatically('contacts');
+            }
+            
+            document.getElementById(modalId).style.display = 'block';
+            
+            // פוקוס על השדה הראשון
+            setTimeout(() => {
+                const firstInput = document.querySelector(`#${modalId} input, #${modalId} textarea`);
+                if (firstInput) firstInput.focus();
+            }, 100);
+        }
+
+        // סגירת מודל
+        function closeModal() {
+            document.querySelectorAll('.modal').forEach(modal => {
+                modal.style.display = 'none';
+            });
+            
+            // איפוס שדות
+            document.querySelectorAll('.modal input, .modal textarea').forEach(input => {
+                input.value = '';
+            });
+        }
+        
+        function showVerificationModal() {
+            closeModal();
+            document.getElementById('verificationModal').style.display = 'block';
+        }
+
+        // הוספת איש קשר חדש - פונקציה מעודכנת
+        function addNewContact() {
+            const name = document.getElementById('contactName').value.trim();
+            const phone = document.getElementById('contactPhone').value.trim();
+            
+            if (!name) {
+                alert('אנא הכניסו שם');
+                return;
+            }
+            
+            if (!phone) {
+                alert('אנא הכניסו מספר טלפון');
+                return;
+            }
+
+            // בדיקה האם איש הקשר כבר קיים ברשימה
+            const existingContact = contacts.find(c => c.phone === phone);
+            if (existingContact) {
+                showNotification(`איש הקשר ${name} כבר קיים ברשימה שלך.`);
+                closeModal();
+                return;
+            }
+            
+            // בדיקה אם המספר קיים ברשימת המשתמשים "הרשומים"
+            const userExists = registeredUsers.find(user => user.phone === phone);
+
+            if (userExists) {
+                // אם המשתמש קיים, מדמים הוספה
+                const newContact = {
+                    id: Date.now(),
+                    name: name,
+                    phone: phone,
+                    avatar: getFirstLetter(name),
+                    online: userExists.online
+                };
+                
+                contacts.push(newContact);
+                showNotification(`איש הקשר ${name} נוסף בהצלחה.`);
+                closeModal();
+                renderContacts();
+                
+                // התחלת צ'אט חדש עם איש הקשר
+                startChat(name, newContact.avatar, newContact.online, newContact.id);
+
+            } else {
+                // אם המשתמש לא קיים, מדמים שליחת הזמנה
+                showNotification(`המספר ${phone} אינו רשום. נשלחה הודעה להזמנה.`);
+                closeModal();
+                
+                // ניתן לשמור את הפרטים לשימוש עתידי, אם המשתמש ירשם
+                pendingContact = { name, phone };
+            }
+        }
+        
+        // פונקציה להוספת סטטוס חדש
+        function addNewStatus() {
+            const statusText = document.getElementById('statusText').value.trim();
+            
+            if (!statusText) {
+                alert('אנא הכניסו תוכן לסטטוס.');
+                return;
+            }
+            
+            const newStatus = {
+                id: Date.now(),
+                name: 'אני', // לצורך הדגמה
+                avatar: 'א',
+                text: statusText,
+                time: 'ממש עכשיו',
+                viewed: false
+            };
+            
+            statuses.unshift(newStatus);
+            showNotification('הסטטוס פורסם בהצלחה!');
+            closeModal();
+            renderStatus();
+        }
+
+        // פונקציה להוספת ערוץ חדש
+        function addNewChannel() {
+            const channelName = document.getElementById('channelName').value.trim();
+            const channelDesc = document.getElementById('channelDesc').value.trim();
+
+            if (!channelName) {
+                alert('אנא הכניסו שם לערוץ');
+                return;
+            }
+            
+            const newChannel = {
+                id: Date.now(),
+                name: channelName,
+                avatar: '📢',
+                description: channelDesc,
+                subscribers: 1
+            };
+            
+            channels.unshift(newChannel);
+            showNotification(`הערוץ "${channelName}" נוצר בהצלחה.`);
+            closeModal();
+            renderChannels();
+        }
+
+        // הפעלת פונקציות בריצה הראשונה
+        document.addEventListener('DOMContentLoaded', () => {
+            renderContent();
+        });
+    </script>
 </body>
 </html>
