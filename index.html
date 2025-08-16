@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Prompt → STL (single file MVP)</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--muted:#94a3b8;--accent:#7c3aed}
+    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial}
+    body{display:flex;align-items:stretch;gap:18px;padding:18px;background:linear-gradient(180deg,#071024 0,#071827 100%);color:#e6eef8}
+    .panel{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);border-radius:12px;padding:18px;box-shadow:0 6px 30px rgba(2,6,23,0.6)}
+    .left{width:420px;min-width:320px}
+    .right{flex:1;min-height:520px;display:flex;flex-direction:column}
+    h1{margin:0 0 10px 0;font-size:18px}
+    label{font-size:13px;color:var(--muted);display:block;margin-bottom:8px}
+    textarea{width:100%;height:150px;padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit;resize:vertical;font-size:14px}
+    .row{display:flex;gap:10px;margin-top:12px}
+    button{cursor:pointer;padding:10px 14px;border-radius:10px;border:0;font-weight:600}
+    .btn-primary{background:var(--accent);color:white}
+    .btn-ghost{background:transparent;color:var(--muted);border:1px solid rgba(255,255,255,0.04)}
+    .status{margin-top:10px;font-size:13px;color:var(--muted)}
+    #viewer{flex:1;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,0.03);background:linear-gradient(180deg,#071827 0,#071024 100%)}
+    .meta{font-size:12px;color:var(--muted);margin-top:8px}
+    .footer{font-size:12px;color:var(--muted);margin-top:12px}
+    a.small{color:var(--accent);text-decoration:none}
+    @media (max-width:880px){body{flex-direction:column;padding:12px}.left{width:auto}}
+  </style>
+</head>
+<body>
+  <div class="panel left">
+    <h1>Prompt → STL (local)</h1>
+    <label for="prompt">Describe your object</label>
+    <textarea id="prompt" placeholder='e.g. "40mm x 20mm x 10mm rectangular box" or "a box 4cm by 2cm by 1cm"'>40mm x 20mm x 10mm box</textarea>
+
+    <div class="row">
+      <button id="generateBtn" class="btn-primary">Generate STL</button>
+      <button id="downloadBtn" class="btn-ghost" disabled>Download STL</button>
+      <button id="resetBtn" class="btn-ghost">Reset</button>
+    </div>
+
+    <div class="status" id="status">Ready — type a prompt and click Generate.</div>
+    <div class="meta" id="meta"></div>
+    <div class="footer">This single-file MVP generates a printable ASCII STL (axis-aligned box). You can extend parsing/generation later.</div>
+  </div>
+
+  <div class="panel right">
+    <div id="viewer"></div>
+  </div>
+
+  <!-- Module script: three.js + examples via unpkg (module imports) -->
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.165.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.165.0/examples/jsm/controls/OrbitControls.js";
+    import { STLLoader } from "https://unpkg.com/three@0.165.0/examples/jsm/loaders/STLLoader.js";
+
+    // ---- UI elements ----
+    const promptEl = document.getElementById("prompt");
+    const generateBtn = document.getElementById("generateBtn");
+    const downloadBtn = document.getElementById("downloadBtn");
+    const statusEl = document.getElementById("status");
+    const metaEl = document.getElementById("meta");
+    const resetBtn = document.getElementById("resetBtn");
+    const viewerEl = document.getElementById("viewer");
+
+    // ---- Three.js scene setup ----
+    const scene = new THREE.Scene();
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
+    renderer.setClearColor(0x071022, 1);
+    viewerEl.appendChild(renderer.domElement);
+
+    const camera = new THREE.PerspectiveCamera(40, viewerEl.clientWidth / viewerEl.clientHeight, 0.1, 2000);
+    camera.position.set(120, 120, 120);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0,0,0);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambient);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(100, 200, 100);
+    scene.add(dir);
+
+    // ground grid helper
+    const grid = new THREE.GridHelper(200, 40, 0x1f2b3a, 0x0b1220);
+    grid.position.y = -60;
+    scene.add(grid);
+
+    // currently previewed mesh
+    let previewGroup = new THREE.Group();
+    scene.add(previewGroup);
+
+    // handle resize
+    window.addEventListener("resize", () => {
+      renderer.setSize(viewerEl.clientWidth, viewerEl.clientHeight);
+      camera.aspect = viewerEl.clientWidth / viewerEl.clientHeight;
+      camera.updateProjectionMatrix();
+    });
+
+    // animation loop
+    function animate(){
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ---- Parsing prompt for box dims ----
+    // returns number in mm
+    function parseNumberUnit(token){
+      // trim and match numeric optionally followed by unit
+      // Accept forms like "40", "40mm", "4cm", "1.5in"
+      const m = token.trim().match(/^([0-9]*\.?[0-9]+)\s*(mm|cm|in)?$/i);
+      if(!m) return null;
+      let val = parseFloat(m[1]);
+      const unit = (m[2] || "mm").toLowerCase();
+      if(unit === "cm") val = val * 10;           // 1 cm = 10 mm
+      if(unit === "in") val = val * 25.4;         // 1 in = 25.4 mm
+      return val;
+    }
+
+    function parseBoxDimsFromPrompt(prompt){
+      const p = (prompt || "").toLowerCase();
+
+      // pattern like "A x B x C" where A,B,C may have units
+      // Accept separators: x, ×, by
+      const byPattern = /([0-9]*\.?[0-9]+\s*(?:mm|cm|in)?)\s*(?:x|×|by)\s*([0-9]*\.?[0-9]+\s*(?:mm|cm|in)?)\s*(?:x|×|by)\s*([0-9]*\.?[0-9]+\s*(?:mm|cm|in)?)/i;
+      const m1 = p.match(byPattern);
+      if(m1){
+        const a = parseNumberUnit(m1[1]);
+        const b = parseNumberUnit(m1[2]);
+        const c = parseNumberUnit(m1[3]);
+        if([a,b,c].every(n => Number.isFinite(n))) return { x:a, y:b, z:c };
+      }
+
+      // fallback: find first three numbers (with optional units)
+      const arr = Array.from(p.matchAll(/([0-9]*\.?[0-9]+)\s*(mm|cm|in)?/g)).map(m => parseNumberUnit((m[1] + (m[2]||"")).trim())).filter(v => v != null);
+      if(arr.length >= 3) return { x: arr[0], y: arr[1], z: arr[2] };
+
+      // Try text like "box 4cm by 2cm by 1cm" handled above, else default
+      return { x:40, y:20, z:10 }; // mm fallback
+    }
+
+    // ---- STL generation (ASCII) ----
+    // generate ASCII STL for axis-aligned box centered at origin (units: mm)
+    function generateBoxSTL(size){
+      const x = size.x, y = size.y, z = size.z;
+      const hx = x/2, hy = y/2, hz = z/2;
+
+      function facet(nx, ny, nz, v1, v2, v3){
+        return `  facet normal ${nx} ${ny} ${nz}
+    outer loop
+      vertex ${v1[0]} ${v1[1]} ${v1[2]}
+      vertex ${v2[0]} ${v2[1]} ${v2[2]}
+      vertex ${v3[0]} ${v3[1]} ${v3[2]}
+    endloop
+  endfacet
+`;
+      }
+
+      let stl = `solid box\n`;
+      // +Z top
+      stl += facet(0,0,1, [-hx,-hy,hz], [ hx,-hy,hz], [ hx, hy,hz]);
+      stl += facet(0,0,1, [-hx,-hy,hz], [ hx, hy,hz], [-hx, hy,hz]);
+      // -Z bottom
+      stl += facet(0,0,-1, [-hx,-hy,-hz], [-hx, hy,-hz], [ hx, hy,-hz]);
+      stl += facet(0,0,-1, [-hx,-hy,-hz], [ hx, hy,-hz], [ hx,-hy,-hz]);
+      // +X right
+      stl += facet(1,0,0, [hx,-hy,-hz], [hx, hy,-hz], [hx, hy, hz]);
+      stl += facet(1,0,0, [hx,-hy,-hz], [hx, hy, hz], [hx,-hy, hz]);
+      // -X left
+      stl += facet(-1,0,0, [-hx,-hy,-hz], [-hx,-hy, hz], [-hx, hy, hz]);
+      stl += facet(-1,0,0, [-hx,-hy,-hz], [-hx, hy, hz], [-hx, hy,-hz]);
+      // +Y front
+      stl += facet(0,1,0, [-hx,hy,-hz], [-hx,hy, hz], [ hx,hy, hz]);
+      stl += facet(0,1,0, [-hx,hy,-hz], [ hx,hy, hz], [ hx,hy,-hz]);
+      // -Y back
+      stl += facet(0,-1,0, [-hx,-hy,-hz], [ hx,-hy,-hz], [ hx,-hy, hz]);
+      stl += facet(0,-1,0, [-hx,-hy,-hz], [ hx,-hy, hz], [-hx,-hy, hz]);
+
+      stl += `endsolid box\n`;
+      return stl;
+    }
+
+    // ---- Preview: parse STL and add to scene ----
+    const loader = new STLLoader();
+
+    function clearPreview(){
+      while(previewGroup.children.length) previewGroup.remove(previewGroup.children[0]);
+    }
+
+    function addSTLToScene(arrayBuffer, colorHex=0x6d28d9){
+      clearPreview();
+      try {
+        const geometry = loader.parse(arrayBuffer);
+        geometry.computeBoundingBox && geometry.computeBoundingBox();
+        geometry.computeVertexNormals && geometry.computeVertexNormals();
+
+        // center
+        const box = geometry.boundingBox;
+        if(box){
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const center = new THREE.Vector3();
+          box.getCenter(center);
+          geometry.translate(-center.x, -center.y, -center.z);
+          const maxDim = Math.max(size.x, size.y, size.z);
+          const scale = maxDim > 0 ? 60 / maxDim : 1;
+          geometry.scale(scale, scale, scale);
+        }
+
+        const material = new THREE.MeshStandardMaterial({ color: colorHex, metalness: 0.12, roughness: 0.55 });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        previewGroup.add(mesh);
+
+        // adjust camera to fit
+        controls.target.set(0,0,0);
+        camera.position.set(120, 120, 120);
+        controls.update();
+      } catch(err){
+        console.error("STL parse error:", err);
+        statusEl.textContent = "Preview failed (STL parse).";
+      }
+    }
+
+    // ---- Download helper ----
+    let latestBlob = null;
+
+    function enableDownload(blob, filename="model.stl"){
+      latestBlob = blob;
+      downloadBtn.disabled = false;
+      downloadBtn.onclick = () => {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      };
+    }
+
+    // ---- Button handlers ----
+    generateBtn.addEventListener("click", async () => {
+      const prompt = (promptEl.value || "").trim();
+      if(!prompt){
+        statusEl.textContent = "Please enter a prompt.";
+        return;
+      }
+      statusEl.textContent = "Parsing prompt…";
+      // parse dims
+      const dims = parseBoxDimsFromPrompt(prompt); // {x,y,z} in mm
+      // Round dims sensibly for metadata display (digit-by-digit careful calc)
+      function roundTo(val, places){
+        const m = Math.pow(10, places);
+        return Math.round(val * m) / m;
+      }
+      const rx = roundTo(dims.x, 3), ry = roundTo(dims.y, 3), rz = roundTo(dims.z, 3);
+
+      statusEl.textContent = `Generating box ${rx} × ${ry} × ${rz} mm…`;
+      // generate STL string
+      const stlText = generateBoxSTL(dims);
+      const encoder = new TextEncoder();
+      const arrayBuffer = encoder.encode(stlText).buffer;
+      const blob = new Blob([arrayBuffer], { type: "model/stl" });
+      enableDownload(blob, "model.stl");
+
+      // update meta
+      metaEl.textContent = `Size: ${rx} mm × ${ry} mm × ${rz} mm — ASCII STL, ${Math.round(blob.size/1)} bytes`;
+
+      // show preview
+      statusEl.textContent = "Rendering preview…";
+      addSTLToScene(arrayBuffer, 0x6d28d9);
+      statusEl.textContent = "Done — preview ready. Click Download to save the .stl file.";
+    });
+
+    resetBtn.addEventListener("click", () => {
+      promptEl.value = "40mm x 20mm x 10mm box";
+      statusEl.textContent = "Reset to default prompt.";
+      metaEl.textContent = "";
+      clearPreview();
+      downloadBtn.disabled = true;
+      latestBlob = null;
+    });
+
+    // initial sample preview
+    (function initial(){
+      const sample = promptEl.value.trim();
+      const dims = parseBoxDimsFromPrompt(sample);
+      const stlText = generateBoxSTL(dims);
+      const encoder = new TextEncoder();
+      const arrayBuffer = encoder.encode(stlText).buffer;
+      addSTLToScene(arrayBuffer, 0x6d28d9);
+      metaEl.textContent = `Sample: ${dims.x}mm × ${dims.y}mm × ${dims.z}mm`;
+      const blob = new Blob([arrayBuffer], { type: "model/stl" });
+      enableDownload(blob, "model.stl");
+      statusEl.textContent = "Ready — previewing sample box. Edit prompt and click Generate.";
+    })();
+
+  </script>
+</body>
+</html>
